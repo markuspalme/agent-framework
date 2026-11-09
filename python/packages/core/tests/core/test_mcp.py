@@ -3037,6 +3037,93 @@ async def test_mcp_tool_reconnects_after_session_terminated_error():
     assert server.sessions[1].call_tool.await_count == 1
 
 
+class _FlakyReconnectServer(MCPTool):
+    """Reconnects with each queued outcome in turn: ``("session", side_effect)`` opens a new
+    framework-owned session whose ``call_tool`` has that side effect, and ``("fail", exception)``
+    fails the reconnect like an unreachable server."""
+
+    def __init__(self, outcomes: list[tuple[str, Any]], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.outcomes = outcomes
+        self.connect_count = 0
+
+    async def _reconnect_without_loading(self) -> None:
+        self.connect_count += 1
+        kind, outcome = self.outcomes.pop(0)
+        if kind == "fail":
+            # A failed reset leaves the tool without a connection, as _connect_on_owner does.
+            self._connection = cast(Any, None)
+            self.is_connected = False
+            raise outcome
+        mock_session = Mock(spec=ClientSession)
+        mock_session.call_tool = AsyncMock(side_effect=outcome)
+        _set_framework_owned_session(self, mock_session)
+        self.is_connected = True
+        self._recoverable_close_generation = self._close_generation
+        self._tools_loaded = self._prompts_loaded = True
+
+    def get_mcp_client(self) -> _AsyncGeneratorContextManager[Any, None]:
+        return None  # type: ignore[return-value]  # pyrefly: ignore[bad-return]  # ty: ignore[invalid-return-type]
+
+
+def _text_result(text: str) -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+
+
+async def test_mcp_tool_reconnects_after_connection_closed_error():
+    """Once the transport has ended, every request fails with CONNECTION_CLOSED; that is a lost connection."""
+    closed = MCPError(types.CONNECTION_CLOSED, "Connection closed")
+    server = _FlakyReconnectServer([("session", closed), ("session", [_text_result("recovered")])], name="test_server")
+    await server._reconnect_without_loading()
+
+    result = await server.call_tool("test_tool", param="test_value")
+
+    assert _mcp_result_to_text(result) == "recovered"
+    assert server.connect_count == 2
+
+
+async def test_mcp_tool_recovers_on_next_call_after_failed_reconnect():
+    """A reconnect that fails while the server is down must not leave the tool disconnected for good."""
+    closed = MCPError(types.CONNECTION_CLOSED, "Connection closed")
+    server_down = ConnectionError("server unreachable")
+    server = _FlakyReconnectServer(
+        [
+            ("session", closed),
+            ("fail", server_down),
+            ("fail", server_down),
+            ("session", [_text_result("recovered")]),
+        ],
+        name="test_server",
+    )
+    await server._reconnect_without_loading()
+
+    with pytest.raises(ToolExecutionException, match="Failed to reconnect"):
+        await server.call_tool("test_tool", param="test_value")
+    assert not server.is_connected
+
+    # Still down: this call tries to reconnect, fails, and leaves the next call to try again.
+    with pytest.raises(ToolExecutionException, match="Failed to reconnect"):
+        await server.call_tool("test_tool", param="test_value")
+
+    result = await server.call_tool("test_tool", param="test_value")
+
+    assert _mcp_result_to_text(result) == "recovered"
+    assert server.connect_count == 4
+
+
+async def test_mcp_tool_does_not_reconnect_after_close():
+    """An explicit close() is not a lost connection, so later tool calls do not reconnect."""
+    server = _FlakyReconnectServer(
+        [("session", [_text_result("ok")]), ("session", [_text_result("reconnected")])], name="test_server"
+    )
+    await server._reconnect_without_loading()
+    await server.close()
+
+    with pytest.raises(ToolExecutionException):
+        await server.call_tool("test_tool", param="test_value")
+    assert server.connect_count == 1
+
+
 async def test_mcp_tool_call_tool_raises_on_is_error():
     """Test that call_tool raises ToolExecutionException when MCP returns is_error=True."""
 

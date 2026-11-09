@@ -1274,6 +1274,9 @@ class MCPTool:
         self._lifecycle_lock = asyncio.Lock()
         self._lifecycle_request_lock = asyncio.Lock()
         self._close_generation = 0
+        # Close generation of the last framework-owned connection. While it still matches, a missing connection
+        # means a reconnect failed rather than close() was called, so tool calls recover it.
+        self._recoverable_close_generation: int | None = None
         # Cancelling a lifecycle waiter does not stop the owner's setup or teardown.
         self._lifecycle_idle = asyncio.Event()
         self._lifecycle_idle.set()
@@ -2486,10 +2489,16 @@ class MCPTool:
     def _is_connection_loss(self, exception: Exception) -> bool:
         """Return whether an exception proves that the active MCP connection ended."""
         from anyio import ClosedResourceError
-        from mcp import MCPError
+        from mcp import MCPError, types
 
+        # Once the transport has ended, the dispatcher answers every request with CONNECTION_CLOSED. Servers also use
+        # -32000 for ordinary failures, so the code alone is ambiguous; the dispatcher's own message is not.
         return isinstance(exception, ClosedResourceError) or (
-            isinstance(exception, MCPError) and "session terminated" in exception.error.message.lower()
+            isinstance(exception, MCPError)
+            and (
+                (exception.error.code == types.CONNECTION_CLOSED and exception.error.message == "Connection closed")
+                or "session terminated" in exception.error.message.lower()
+            )
         )
 
     async def _reconnect_without_loading(self) -> None:
@@ -2672,6 +2681,8 @@ class MCPTool:
             connection = self._require_connection()
             logger.debug("Connected to MCP server: %s", connection.client or connection.session)
             self.is_connected = True
+            if connection.is_framework_owned:
+                self._recoverable_close_generation = self._close_generation
             if connection.client is not None:
                 await self._listen_capability_list_changes(connection.client)
             if load_configured and self.load_tools_flag:
@@ -3726,6 +3737,26 @@ class MCPTool:
             failed_connection = self._connection
             close_generation = self._close_generation
             span_error_recorded = False
+            if (
+                attempt == 0
+                and failed_connection is None
+                and self._recoverable_close_generation == close_generation
+                and self._lifecycle_idle.is_set()
+            ):
+                # An earlier reconnect failed and left no connection; recover it instead of failing every call.
+                # A reset that is still in progress also has no connection, but is not a failed reconnect.
+                try:
+                    await self._recover_connection_after_loss(
+                        operation="tool call",
+                        inner_exception=RuntimeError("MCPTool is not connected."),
+                        load_configured=True,
+                        close_generation=close_generation,
+                    )
+                except ToolExecutionException as recovery_error:
+                    if span.is_recording():
+                        set_mcp_span_error(span, type(recovery_error).__name__, str(recovery_error))
+                    raise
+                failed_connection = self._connection
             try:
                 result = await self._invoke_tool(tool_name, kwargs, trace_context)
                 _capture_mcp_tool_result(result)
